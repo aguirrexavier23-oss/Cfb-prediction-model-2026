@@ -313,14 +313,47 @@ def run_walk_forward_backtest(all_games: pd.DataFrame, seasons, home_field=2.0, 
     return pd.DataFrame(forecasts)
 
 
-def run_holdout_tuning(all_games: pd.DataFrame, tuning_seasons, holdout_seasons):
-    """Select simple settings on earlier seasons and evaluate once on later seasons."""
+def run_walk_forward_grid(all_games: pd.DataFrame, seasons, home_fields, form_weights, margin_sd=14.0):
+    """Evaluate a parameter grid while fitting ratings only once per home-field setting/week."""
+    forecasts = {(home_field, form_weight): [] for home_field in home_fields for form_weight in form_weights}
+    for home_field in home_fields:
+        for year in seasons:
+            season_games = all_games[all_games.season == year]
+            for week in sorted(season_games.week.unique()):
+                prior = season_games[season_games.week < week]
+                target = season_games[season_games.week == week]
+                season_r, recent_r, _ = calculate_ratings(prior, home_field=home_field)
+                for game in target.itertuples():
+                    neutral_site = bool(getattr(game, "neutral_site", False))
+                    actual_home_win = int(game.home_points > game.away_points)
+                    actual_margin = float(game.home_points - game.away_points)
+                    for form_weight in form_weights:
+                        home_rating = (1 - form_weight) * season_r.get(game.home_team, 0.0) + form_weight * recent_r.get(game.home_team, 0.0)
+                        away_rating = (1 - form_weight) * season_r.get(game.away_team, 0.0) + form_weight * recent_r.get(game.away_team, 0.0)
+                        predicted_margin = home_rating - away_rating + (0.0 if neutral_site else home_field)
+                        p_home = 1 / (1 + math.exp(-1.702 * predicted_margin / margin_sd))
+                        forecasts[(home_field, form_weight)].append({
+                            "season": int(year), "week": int(week),
+                            "home_team": game.home_team, "away_team": game.away_team,
+                            "predicted_home_margin": predicted_margin,
+                            "actual_home_margin": actual_margin,
+                            "home_win_probability": p_home,
+                            "actual_home_win": actual_home_win,
+                            "absolute_margin_error": abs(predicted_margin - actual_margin),
+                            "squared_margin_error": (predicted_margin - actual_margin) ** 2,
+                            "brier_component": (p_home - actual_home_win) ** 2,
+                            "correct_winner": int((p_home >= 0.5) == bool(actual_home_win)),
+                        })
+    return {setting: pd.DataFrame(rows) for setting, rows in forecasts.items()}
+
+
+def run_holdout_tuning(grid_forecasts, tuning_seasons, holdout_seasons):
+    """Select settings on earlier seasons and evaluate them once on later seasons."""
     candidates = []
     for home_field in (1.5, 2.0, 2.5):
         for form_weight in (0.15, 0.30):
-            tuning_forecasts = run_walk_forward_backtest(
-                all_games, tuning_seasons, home_field=home_field, form_weight=form_weight
-            )
+            tuning_forecasts = grid_forecasts[(home_field, form_weight)]
+            tuning_forecasts = tuning_forecasts[tuning_forecasts.season.isin(tuning_seasons)]
             tuning_mae = float(summarize_forecasts(tuning_forecasts).iloc[0].Spread_MAE)
             candidates.append({
                 "Home_Field": home_field,
@@ -329,13 +362,10 @@ def run_holdout_tuning(all_games: pd.DataFrame, tuning_seasons, holdout_seasons)
             })
     candidates = pd.DataFrame(candidates).sort_values("Tuning_Spread_MAE").reset_index(drop=True)
     best = candidates.iloc[0]
-    baseline = run_walk_forward_backtest(all_games, holdout_seasons)
-    tuned = run_walk_forward_backtest(
-        all_games,
-        holdout_seasons,
-        home_field=float(best.Home_Field),
-        form_weight=float(best.Recent_Form_Weight),
-    )
+    baseline = grid_forecasts[(2.0, 0.25)]
+    baseline = baseline[baseline.season.isin(holdout_seasons)].copy()
+    tuned = grid_forecasts[(float(best.Home_Field), float(best.Recent_Form_Weight))]
+    tuned = tuned[tuned.season.isin(holdout_seasons)].copy()
     return candidates, best, baseline, tuned
 
 
@@ -484,7 +514,17 @@ if st.button("Run historical backtest"):
             st.session_state.backtest_forecasts = None
         else:
             st.session_state.backtest_error = None
-            st.session_state.backtest_forecasts = run_walk_forward_backtest(historical, range(start_year, end_year + 1))
+            if start_year <= 2018 and end_year >= 2025:
+                grid_forecasts = run_walk_forward_grid(
+                    historical,
+                    range(start_year, end_year + 1),
+                    home_fields=(1.5, 2.0, 2.5),
+                    form_weights=(0.15, 0.25, 0.30),
+                )
+                st.session_state.backtest_forecasts = grid_forecasts[(2.0, 0.25)]
+            else:
+                grid_forecasts = None
+                st.session_state.backtest_forecasts = run_walk_forward_backtest(historical, range(start_year, end_year + 1))
             closing_lines, lines_error = fetch_historical_closing_lines(start_year, end_year)
             st.session_state.backtest_lines_error = lines_error
             st.session_state.holdout_lines = closing_lines
@@ -496,7 +536,7 @@ if st.button("Run historical backtest"):
                 tuning_seasons = list(range(2018, 2023))
                 holdout_seasons = list(range(2023, 2026))
                 candidates, best, baseline, tuned = run_holdout_tuning(
-                    historical, tuning_seasons, holdout_seasons
+                    grid_forecasts, tuning_seasons, holdout_seasons
                 )
                 st.session_state.holdout_candidates = candidates
                 st.session_state.holdout_best = best.to_dict()
