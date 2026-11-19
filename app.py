@@ -528,6 +528,15 @@ if forecasts is not None and not forecasts.empty:
                 "Home_Line_ATS_Pct": "{:.1%}",
             }), hide_index=True, use_container_width=True)
 
+            # Existing browser sessions may retain a pre-gap comparison table after deploy.
+            if "model_market_gap_band" not in market.columns:
+                market["model_market_gap"] = (market.predicted_home_margin - market.market_home_margin).abs()
+                market["model_market_gap_band"] = pd.cut(
+                    market.model_market_gap,
+                    bins=[0, 1, 3, 5, np.inf],
+                    labels=["Under 1 pt", "1–<3 pts", "3–<5 pts", "5+ pts"],
+                    right=False,
+                )
             edge_rows = []
             for band, band_games in market.groupby("model_market_gap_band", observed=True):
                 wins, losses, pushes, pct = cover_record(band_games.model_cover_result)
