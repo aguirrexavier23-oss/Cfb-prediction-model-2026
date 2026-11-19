@@ -233,7 +233,9 @@ def calculate_ratings(games: pd.DataFrame, home_field=2.0):
     X = np.zeros((len(games), len(teams)), dtype=float)
     # Convert observed home margins to neutral-field margins before fitting team ratings.
     # Neutral-site games receive no adjustment.
-    neutral = games.neutral_site.fillna(False).to_numpy(dtype=bool)
+    # Older Streamlit sessions can retain a pre-neutral-site DataFrame after deploy.
+    neutral_values = games["neutral_site"] if "neutral_site" in games.columns else pd.Series(False, index=games.index)
+    neutral = neutral_values.fillna(False).to_numpy(dtype=bool)
     y = games.home_margin.to_numpy(dtype=float) - np.where(neutral, 0.0, home_field)
     weeks = games.week.to_numpy(dtype=float)
     max_week = max(weeks.max(initial=0), 1)
@@ -256,10 +258,10 @@ def calculate_ratings(games: pd.DataFrame, home_field=2.0):
         for g in games.itertuples():
             if g.home_team == team:
                 opponent = g.away_team
-                margin = g.home_margin - (0.0 if bool(g.neutral_site) else home_field)
+                margin = g.home_margin - (0.0 if bool(getattr(g, "neutral_site", False)) else home_field)
             elif g.away_team == team:
                 opponent = g.home_team
-                margin = -g.home_margin + (0.0 if bool(g.neutral_site) else home_field)
+                margin = -g.home_margin + (0.0 if bool(getattr(g, "neutral_site", False)) else home_field)
             else:
                 continue
             w = max(0.45, math.exp(-0.18 * (max_week - g.week)))
