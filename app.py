@@ -10,8 +10,8 @@ import streamlit as st
 SEASON = 2026
 BASE_URL = "https://api.collegefootballdata.com"
 
-st.set_page_config(page_title="2026 CFB Matchup Model", page_icon="🏈", layout="wide")
-st.title("🏈 2026 College Football Matchup Model")
+st.set_page_config(page_title="Cover 0", page_icon="🏈", layout="wide")
+st.title("🏈 Cover 0")
 st.caption("Season-aware projections from completed results, opponent strength, recent form, and home field.")
 
 
