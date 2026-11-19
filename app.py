@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from datetime import datetime, timezone
 
 import numpy as np
@@ -186,13 +187,88 @@ def project_upcoming_games(upcoming, season_r, recent_r, home_field, form_weight
         home_margin = home_rating - away_rating + (0.0 if game.neutral_site else home_field)
         home_probability = 1 / (1 + math.exp(-1.702 * home_margin / margin_sd))
         rows.append({
-            "Week": int(game.week), "Kickoff (UTC)": game.kickoff_utc,
-            "Away team": away, "Home team": home,
-            "Projected spread": f"{home} {-home_margin:+.1f}",
-            "Home win probability": home_probability,
-            "Away win probability": 1 - home_probability,
+            "season": int(game.season), "week": int(game.week),
+            "kickoff_utc": game.kickoff.isoformat(),
+            "away_team": away, "home_team": home,
+            "neutral_site": bool(game.neutral_site),
+            "projected_spread": f"{home} {-home_margin:+.1f}",
+            "predicted_home_margin": home_margin,
+            "home_win_probability": home_probability,
+            "away_win_probability": 1 - home_probability,
         })
     return pd.DataFrame(rows)
+
+
+def grade_saved_forecasts(uploaded_files, completed_games):
+    """Match saved pregame forecast CSVs against completed scores in the loaded season."""
+    snapshots = []
+    for uploaded_file in uploaded_files:
+        frame = pd.read_csv(uploaded_file)
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        # Legacy downloads had display labels, including "Kickoff (UTC)" and "Home team".
+        legacy = {
+            "kickoff_utc": "kickoff (utc)", "away_team": "away team", "home_team": "home team",
+            "projected_spread": "projected spread", "home_win_probability": "home win probability",
+            "away_win_probability": "away win probability",
+        }
+        frame = frame.rename(columns={old: new for new, old in legacy.items() if new not in frame.columns and old in frame.columns})
+        if not {"home_team", "away_team", "home_win_probability"}.issubset(frame.columns):
+            continue
+        if "season" not in frame:
+            frame["season"] = SEASON
+        if "week" not in frame:
+            frame["week"] = 0
+        frame["season"] = pd.to_numeric(frame.season, errors="coerce").fillna(SEASON).astype(int)
+        frame["week"] = pd.to_numeric(frame.week, errors="coerce").fillna(0).astype(int)
+        frame["home_team"] = frame.home_team.astype("string").str.strip()
+        frame["away_team"] = frame.away_team.astype("string").str.strip()
+        if "kickoff_utc" in frame:
+            frame["kickoff_utc"] = pd.to_datetime(frame.kickoff_utc, errors="coerce", utc=True)
+        else:
+            frame["kickoff_utc"] = pd.NaT
+        if "forecast_generated_utc" in frame:
+            frame["forecast_generated_utc"] = pd.to_datetime(frame.forecast_generated_utc, errors="coerce", utc=True)
+        else:
+            frame["forecast_generated_utc"] = pd.NaT
+        for probability_col in ("home_win_probability", "away_win_probability"):
+            frame[probability_col] = pd.to_numeric(
+                frame[probability_col].astype(str).str.replace("%", "", regex=False), errors="coerce"
+            )
+            if frame[probability_col].dropna().gt(1).any():
+                frame[probability_col] = frame[probability_col] / 100
+        if "predicted_home_margin" not in frame:
+            if "projected_spread" not in frame:
+                continue
+            spread_values = pd.to_numeric(
+                frame.projected_spread.astype(str).str.extract(r"([+-]?\d+(?:\.\d+)?)\s*$")[0], errors="coerce"
+            )
+            starts_with_home = frame.apply(
+                lambda row: str(row.projected_spread).strip().lower().startswith(str(row.home_team).lower()), axis=1
+            )
+            frame["predicted_home_margin"] = np.where(starts_with_home, -spread_values, np.nan)
+        frame["predicted_home_margin"] = pd.to_numeric(frame.predicted_home_margin, errors="coerce")
+        snapshots.append(frame)
+    if not snapshots:
+        return pd.DataFrame(), "Upload a Cover 0 upcoming-predictions CSV with teams and win probabilities.", 0
+
+    forecasts = pd.concat(snapshots, ignore_index=True)
+    before_kickoff = forecasts.forecast_generated_utc.isna() | forecasts.kickoff_utc.isna() | (
+        forecasts.forecast_generated_utc < forecasts.kickoff_utc
+    )
+    excluded_late = int((~before_kickoff).sum())
+    forecasts = forecasts[before_kickoff].copy()
+    keys = ["season", "week", "home_team", "away_team"]
+    forecasts = forecasts.sort_values("forecast_generated_utc").drop_duplicates(keys, keep="last")
+    actuals = completed_games[keys + ["home_margin", "home_points", "away_points"]].copy()
+    actuals["actual_home_win"] = (actuals.home_margin > 0).astype(int)
+    scored = forecasts.merge(actuals, on=keys, how="inner")
+    if scored.empty:
+        return scored, None, excluded_late
+    scored["actual_home_margin"] = scored.home_margin
+    scored["absolute_margin_error"] = (scored.predicted_home_margin - scored.home_margin).abs()
+    scored["correct_winner"] = ((scored.home_win_probability >= 0.5) == (scored.actual_home_win == 1)).astype(int)
+    scored["brier_component"] = (scored.home_win_probability - scored.actual_home_win) ** 2
+    return scored, None, excluded_late
 
 
 def restrict_to_fbs_matchups(games, fbs_teams):
@@ -619,7 +695,12 @@ else:
     )
     as_of = datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC")
     st.caption(f"{len(upcoming_predictions)} scheduled matchups · projections generated {as_of}. Ratings use the {len(games)} completed games currently loaded above. Kickoff times are UTC. Download a dated CSV to preserve this snapshot before results change.")
-    st.dataframe(upcoming_predictions.style.format({
+    display_predictions = upcoming_predictions.rename(columns={
+        "week": "Week", "kickoff_utc": "Kickoff (UTC)", "away_team": "Away team",
+        "home_team": "Home team", "projected_spread": "Projected spread",
+        "home_win_probability": "Home win probability", "away_win_probability": "Away win probability",
+    })[["Week", "Kickoff (UTC)", "Away team", "Home team", "Projected spread", "Home win probability", "Away win probability"]]
+    st.dataframe(display_predictions.style.format({
         "Home win probability": "{:.1%}", "Away win probability": "{:.1%}"
     }), hide_index=True, use_container_width=True)
     snapshot = upcoming_predictions.copy()
@@ -630,6 +711,60 @@ else:
         file_name=f"cover0_upcoming_predictions_{SEASON}.csv",
         mime="text/csv",
     )
+
+st.markdown("#### Grade saved forecasts")
+st.caption("Upload one or more Cover 0 prediction CSVs after games finish. Cover 0 will match them to completed scores and grade only forecasts saved before kickoff when timestamps are available.")
+forecast_files = st.file_uploader(
+    "Upload saved prediction CSVs to grade",
+    type=["csv"],
+    accept_multiple_files=True,
+    key="forecast_grading_upload",
+)
+if forecast_files:
+    scored_forecasts, grading_error, excluded_late = grade_saved_forecasts(forecast_files, games)
+    if grading_error:
+        st.error(grading_error)
+    elif scored_forecasts.empty:
+        st.info("No saved forecasts matched completed games yet. Keep the CSV and upload it again after those games finish.")
+    else:
+        if excluded_late:
+            st.warning(f"Excluded {excluded_late} forecast rows timestamped after kickoff.")
+        summary = {
+            "Games": len(scored_forecasts),
+            "Spread_MAE": scored_forecasts.absolute_margin_error.mean(),
+            "Winner_Accuracy": scored_forecasts.correct_winner.mean(),
+            "Brier_Score": scored_forecasts.brier_component.mean(),
+        }
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Completed games graded", f"{summary['Games']:,}")
+        s2.metric("Spread MAE", f"{summary['Spread_MAE']:.2f} pts")
+        s3.metric("Winner accuracy", f"{summary['Winner_Accuracy']:.1%}")
+        s4.metric("Win-probability Brier", f"{summary['Brier_Score']:.3f}")
+        scored_display = scored_forecasts.assign(
+            Actual_Result=np.where(scored_forecasts.actual_home_win == 1, "Home win", "Away win")
+        )[["week", "away_team", "home_team", "predicted_home_margin", "home_margin",
+           "home_win_probability", "actual_home_win", "Actual_Result"]].rename(columns={
+               "week": "Week", "away_team": "Away team", "home_team": "Home team",
+               "predicted_home_margin": "Predicted home margin", "home_margin": "Actual home margin",
+               "home_win_probability": "Predicted home win probability",
+               "actual_home_win": "Actual home win",
+           })
+        st.dataframe(scored_display.style.format({
+            "Predicted home margin": "+.1f", "Actual home margin": "+.0f",
+            "Predicted home win probability": "{:.1%}", "Actual home win": "{:.0f}",
+        }), hide_index=True, use_container_width=True)
+        with st.spinner("Checking closing spreads for graded games…"):
+            grading_lines, grading_lines_error = fetch_historical_closing_lines(SEASON, SEASON)
+        if grading_lines is not None and not grading_lines.empty:
+            market_grade = compare_to_market(scored_forecasts, grading_lines)
+            if not market_grade.empty:
+                wins, losses, pushes, pct = cover_record(market_grade.model_cover_result)
+                st.write(f"**ATS record vs. closing spreads:** {wins}-{losses}-{pushes} ({pct:.1%}, pushes excluded). Matched lines: {len(market_grade):,}.")
+            else:
+                st.info("No closing spreads matched the completed games yet.")
+        elif grading_lines_error:
+            st.caption(f"ATS grading is not available yet: {grading_lines_error}")
+        st.caption("These results describe this saved forecast sample; they do not guarantee future performance or profit.")
 
 st.markdown("---")
 st.subheader("Historical walk-forward backtest")
