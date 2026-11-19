@@ -259,24 +259,26 @@ def calculate_ratings(games: pd.DataFrame, home_field=2.0):
     season = dict(zip(teams, raw))
 
     # Recent performance: recency-weighted raw margin with simple opponent-strength adjustment.
-    recent = {}
-    counts = {t: 0 for t in teams}
-    for team in teams:
-        vals, ws = [], []
-        for g in games.itertuples():
-            if g.home_team == team:
-                opponent = g.away_team
-                margin = g.home_margin - (0.0 if bool(getattr(g, "neutral_site", False)) else home_field)
-            elif g.away_team == team:
-                opponent = g.home_team
-                margin = -g.home_margin + (0.0 if bool(getattr(g, "neutral_site", False)) else home_field)
-            else:
-                continue
-            w = max(0.45, math.exp(-0.18 * (max_week - g.week)))
-            vals.append(margin + 0.35 * season[opponent])
-            ws.append(w)
-            counts[team] += 1
-        recent[team] = float(np.average(vals, weights=ws)) if vals else 0.0
+    # Aggregate both teams in one pass instead of rescanning every game for
+    # every team. This is algebraically identical and keeps multi-season
+    # walk-forward tuning responsive.
+    recent_numerator = {team: 0.0 for team in teams}
+    recent_denominator = {team: 0.0 for team in teams}
+    counts = {team: 0 for team in teams}
+    for g in games.itertuples():
+        neutral_game = bool(getattr(g, "neutral_site", False))
+        home_margin = g.home_margin - (0.0 if neutral_game else home_field)
+        weight = max(0.45, math.exp(-0.18 * (max_week - g.week)))
+        recent_numerator[g.home_team] += weight * (home_margin + 0.35 * season[g.away_team])
+        recent_denominator[g.home_team] += weight
+        recent_numerator[g.away_team] += weight * (-home_margin + 0.35 * season[g.home_team])
+        recent_denominator[g.away_team] += weight
+        counts[g.home_team] += 1
+        counts[g.away_team] += 1
+    recent = {
+        team: recent_numerator[team] / recent_denominator[team] if recent_denominator[team] else 0.0
+        for team in teams
+    }
     return season, recent, counts
 
 
