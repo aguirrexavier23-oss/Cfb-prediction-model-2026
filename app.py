@@ -311,6 +311,32 @@ def run_walk_forward_backtest(all_games: pd.DataFrame, seasons, home_field=2.0, 
     return pd.DataFrame(forecasts)
 
 
+def run_holdout_tuning(all_games: pd.DataFrame, tuning_seasons, holdout_seasons):
+    """Select simple settings on earlier seasons and evaluate once on later seasons."""
+    candidates = []
+    for home_field in (1.5, 2.0, 2.5):
+        for form_weight in (0.15, 0.30):
+            tuning_forecasts = run_walk_forward_backtest(
+                all_games, tuning_seasons, home_field=home_field, form_weight=form_weight
+            )
+            tuning_mae = float(summarize_forecasts(tuning_forecasts).iloc[0].Spread_MAE)
+            candidates.append({
+                "Home_Field": home_field,
+                "Recent_Form_Weight": form_weight,
+                "Tuning_Spread_MAE": tuning_mae,
+            })
+    candidates = pd.DataFrame(candidates).sort_values("Tuning_Spread_MAE").reset_index(drop=True)
+    best = candidates.iloc[0]
+    baseline = run_walk_forward_backtest(all_games, holdout_seasons)
+    tuned = run_walk_forward_backtest(
+        all_games,
+        holdout_seasons,
+        home_field=float(best.Home_Field),
+        form_weight=float(best.Recent_Form_Weight),
+    )
+    return candidates, best, baseline, tuned
+
+
 def summarize_forecasts(forecasts: pd.DataFrame, group=None):
     by = group or []
     if by:
@@ -459,10 +485,28 @@ if st.button("Run historical backtest"):
             st.session_state.backtest_forecasts = run_walk_forward_backtest(historical, range(start_year, end_year + 1))
             closing_lines, lines_error = fetch_historical_closing_lines(start_year, end_year)
             st.session_state.backtest_lines_error = lines_error
+            st.session_state.holdout_lines = closing_lines
             st.session_state.backtest_market = (
                 compare_to_market(st.session_state.backtest_forecasts, closing_lines)
                 if closing_lines is not None else None
             )
+            if start_year <= 2018 and end_year >= 2025:
+                tuning_seasons = list(range(2018, 2023))
+                holdout_seasons = list(range(2023, 2026))
+                candidates, best, baseline, tuned = run_holdout_tuning(
+                    historical, tuning_seasons, holdout_seasons
+                )
+                st.session_state.holdout_candidates = candidates
+                st.session_state.holdout_best = best.to_dict()
+                st.session_state.holdout_baseline = baseline
+                st.session_state.holdout_tuned = tuned
+                st.session_state.holdout_message = None
+            else:
+                st.session_state.holdout_candidates = None
+                st.session_state.holdout_best = None
+                st.session_state.holdout_baseline = None
+                st.session_state.holdout_tuned = None
+                st.session_state.holdout_message = "Select the full 2018–2025 range to run this chronological holdout."
 
 if st.session_state.get("backtest_error"):
     st.error(st.session_state.backtest_error)
@@ -483,6 +527,42 @@ if forecasts is not None and not forecasts.empty:
         "Winner_Accuracy": "{:.1%}", "Brier_Score": "{:.3f}",
         "Avg_Home_Win_Prob": "{:.1%}", "Actual_Home_Win_Rate": "{:.1%}",
     }), hide_index=True, use_container_width=True)
+
+    st.markdown("#### Chronological holdout: tune 2018–2022, evaluate 2023–2025")
+    st.caption("Six settings are ranked by spread MAE on 2018–2022. The selected home-field and recent-form weights are then evaluated on 2023–2025 and compared with the default settings. The later seasons do not affect setting selection.")
+    if st.session_state.get("holdout_message"):
+        st.info(st.session_state.holdout_message)
+    elif st.session_state.get("holdout_candidates") is not None:
+        candidates = st.session_state.holdout_candidates
+        best = st.session_state.holdout_best
+        st.write(f"Selected settings: **{best['Home_Field']:.1f} point home field** and **{best['Recent_Form_Weight']:.0%} recent-form weight** (training spread MAE **{best['Tuning_Spread_MAE']:.2f} points**).")
+        st.dataframe(candidates.style.format({
+            "Home_Field": "{:.1f}", "Recent_Form_Weight": "{:.0%}", "Tuning_Spread_MAE": "{:.2f}"
+        }), hide_index=True, use_container_width=True)
+        baseline = st.session_state.holdout_baseline
+        tuned = st.session_state.holdout_tuned
+        baseline_summary = summarize_forecasts(baseline).iloc[0]
+        tuned_summary = summarize_forecasts(tuned).iloc[0]
+        holdout_comparison = pd.DataFrame([
+            {"Settings": "Current defaults", "Games": int(baseline_summary.Games), "Spread_MAE": baseline_summary.Spread_MAE,
+             "Winner_Accuracy": baseline_summary.Winner_Accuracy, "Brier_Score": baseline_summary.Brier_Score},
+            {"Settings": "Selected on 2018–2022", "Games": int(tuned_summary.Games), "Spread_MAE": tuned_summary.Spread_MAE,
+             "Winner_Accuracy": tuned_summary.Winner_Accuracy, "Brier_Score": tuned_summary.Brier_Score},
+        ])
+        holdout_lines = st.session_state.get("holdout_lines")
+        if holdout_lines is not None and not holdout_lines.empty:
+            selected_lines = holdout_lines[holdout_lines.season.isin([2023, 2024, 2025])]
+            for label, data in (("Current defaults", baseline), ("Selected on 2018–2022", tuned)):
+                matched = compare_to_market(data, selected_lines)
+                record = cover_record(matched.model_cover_result) if not matched.empty else (0, 0, 0, float("nan"))
+                holdout_comparison.loc[holdout_comparison.Settings == label, "ATS_Record"] = f"{record[0]}-{record[1]}-{record[2]}"
+                holdout_comparison.loc[holdout_comparison.Settings == label, "ATS_Win_Rate"] = record[3]
+        st.dataframe(holdout_comparison.style.format({
+            "Spread_MAE": "{:.2f}", "Winner_Accuracy": "{:.1%}", "Brier_Score": "{:.3f}", "ATS_Win_Rate": "{:.1%}"
+        }), hide_index=True, use_container_width=True)
+        if holdout_lines is None or holdout_lines.empty:
+            st.caption("ATS results are unavailable because no matching historical closing lines were loaded.")
+        st.caption("This is a historical model comparison, not a guarantee of future performance or betting profit.")
 
     market = st.session_state.get("backtest_market")
     if st.session_state.get("backtest_lines_error"):
