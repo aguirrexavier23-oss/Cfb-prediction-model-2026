@@ -170,13 +170,14 @@ def fetch_historical_closing_lines(start_year, end_year):
                     formatted = str(line.get("formattedSpread") or "")
                     home = str(game.get("homeTeam") or "")
                     away = str(game.get("awayTeam") or "")
-                    # formattedSpread names the favorite; a negative spread is its points.
+                    # formattedSpread names the favorite (e.g. "Arizona -10.5").
+                    # Convert that favorite's points into an implied home-team margin.
                     if home and home.lower() in formatted.lower():
-                        home_line = -float(spread)
+                        home_line = abs(float(spread))
                     elif away and away.lower() in formatted.lower():
-                        home_line = float(spread)
+                        home_line = -abs(float(spread))
                     else:
-                        # CFBD spread is signed from the home team's perspective.
+                        # Without a formatted team, fall back to CFBD's raw home-relative sign.
                         home_line = -float(spread)
                     usable.append((str(line.get("provider") or ""), home_line))
                 if not usable:
