@@ -56,11 +56,19 @@ def fetch_games():
     try:
         response = requests.get(
             f"{BASE_URL}/games",
-            params={"year": SEASON, "seasonType": "regular", "division": "fbs"},
+            params={"year": SEASON, "seasonType": "regular", "classification": "fbs"},
             headers={"Authorization": f"Bearer {key}"}, timeout=25,
         )
         response.raise_for_status()
-        return normalize_games(pd.DataFrame(response.json())), None
+        teams_response = requests.get(
+            f"{BASE_URL}/teams/fbs", params={"year": SEASON},
+            headers={"Authorization": f"Bearer {key}"}, timeout=25,
+        )
+        teams_response.raise_for_status()
+        fbs_teams = {str(team["school"]).strip() for team in teams_response.json() if team.get("school")}
+        games = normalize_games(pd.DataFrame(response.json()))
+        games = games[games.home_team.isin(fbs_teams) & games.away_team.isin(fbs_teams)].reset_index(drop=True)
+        return games, None
     except Exception as exc:
         return None, f"Could not fetch season data: {exc}"
 
