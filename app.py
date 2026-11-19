@@ -213,6 +213,13 @@ def compare_to_market(forecasts: pd.DataFrame, closing_lines: pd.DataFrame):
     )
     # result is +1 for a cover, 0 for a push, and -1 for a loss.
     joined["market_cover_result"] = np.sign(joined.actual_home_margin - joined.market_home_margin)
+    joined["model_market_gap"] = (joined.predicted_home_margin - joined.market_home_margin).abs()
+    joined["model_market_gap_band"] = pd.cut(
+        joined.model_market_gap,
+        bins=[0, 1, 3, 5, np.inf],
+        labels=["Under 1 pt", "1–<3 pts", "3–<5 pts", "5+ pts"],
+        right=False,
+    )
     return joined
 
 
@@ -500,9 +507,40 @@ if forecasts is not None and not forecasts.empty:
                 Cover_0_Spread_MAE=("model_margin_error", "mean"),
                 Closing_Line_Spread_MAE=("market_margin_error", "mean"),
             ).reset_index()
+            season_records = []
+            for year, season_market in market.groupby("season"):
+                wins, losses, pushes, pct = cover_record(season_market.model_cover_result)
+                line_wins, line_losses, line_pushes, line_pct = cover_record(season_market.market_cover_result)
+                season_records.append({
+                    "season": year,
+                    "Cover_0_ATS": f"{wins}-{losses}-{pushes}",
+                    "Cover_0_ATS_Pct": pct,
+                    "Home_Line_Record": f"{line_wins}-{line_losses}-{line_pushes}",
+                    "Home_Line_ATS_Pct": line_pct,
+                })
+            market_seasons = market_seasons.merge(pd.DataFrame(season_records), on="season", how="left")
+            st.markdown("#### ATS results by season")
+            st.caption("Records show wins-losses-pushes. ATS rates exclude pushes; small season samples can vary widely.")
             st.dataframe(market_seasons.style.format({
                 "Cover_0_Spread_MAE": "{:.2f}",
                 "Closing_Line_Spread_MAE": "{:.2f}",
+                "Cover_0_ATS_Pct": "{:.1%}",
+                "Home_Line_ATS_Pct": "{:.1%}",
+            }), hide_index=True, use_container_width=True)
+
+            edge_rows = []
+            for band, band_games in market.groupby("model_market_gap_band", observed=True):
+                wins, losses, pushes, pct = cover_record(band_games.model_cover_result)
+                edge_rows.append({
+                    "Model_vs_Line_Gap": str(band),
+                    "Games": len(band_games),
+                    "Cover_0_ATS": f"{wins}-{losses}-{pushes}",
+                    "ATS_Win_Rate": pct,
+                })
+            st.markdown("#### ATS by model-to-line difference")
+            st.caption("Diagnostic buckets show how often Cover 0's side covered as its spread moved away from the closing line. These historical buckets are descriptive, not tuned betting cutoffs.")
+            st.dataframe(pd.DataFrame(edge_rows).style.format({
+                "ATS_Win_Rate": "{:.1%}",
             }), hide_index=True, use_container_width=True)
 
     st.markdown("#### Probability calibration")
