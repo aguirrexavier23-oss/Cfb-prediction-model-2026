@@ -81,6 +81,7 @@ def fetch_games():
         return None, f"Could not fetch and verify FBS season data: {exc}"
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fbs_teams(year=SEASON):
     key = os.getenv("CFBD_API_KEY", "").strip()
     if not key:
@@ -96,6 +97,102 @@ def fetch_fbs_teams(year=SEASON):
     )
     response.raise_for_status()
     return {str(team["school"]).strip() for team in response.json() if team.get("school")}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_upcoming_games(year=SEASON):
+    """Fetch future, uncompleted regular-season FBS-vs-FBS matchups from CFBD."""
+    key = os.getenv("CFBD_API_KEY", "").strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("CFBD_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+    if not key:
+        return None, "CFBD_API_KEY is not set in this app's Secrets."
+    try:
+        response = requests.get(
+            f"{BASE_URL}/games",
+            params={"year": year, "seasonType": "regular", "classification": "fbs"},
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=25,
+        )
+        response.raise_for_status()
+        raw = pd.DataFrame(response.json())
+        if raw.empty:
+            return pd.DataFrame(), None
+        def column(names, default=None):
+            name = next((candidate for candidate in names if candidate in raw.columns), None)
+            return raw[name] if name else pd.Series(default, index=raw.index)
+
+        games = pd.DataFrame({
+            "season": pd.to_numeric(column(["season", "year"], year), errors="coerce"),
+            "week": pd.to_numeric(column(["week"], 0), errors="coerce").fillna(0),
+            "season_type": column(["seasonType", "season_type"], "regular").astype(str).str.lower(),
+            "kickoff": pd.to_datetime(column(["startDate", "start_date"]), errors="coerce", utc=True),
+            "completed": column(["completed", "is_completed"], False),
+            "neutral_site": column(["neutralSite", "neutral_site"], False),
+            "home_team": column(["homeTeam", "home_team", "home"], "").astype("string").str.strip(),
+            "away_team": column(["awayTeam", "away_team", "away"], "").astype("string").str.strip(),
+            "home_classification": column(["homeClassification", "home_classification"], "").astype(str).str.lower(),
+            "away_classification": column(["awayClassification", "away_classification"], "").astype(str).str.lower(),
+        })
+        if games["completed"].dtype != bool:
+            games["completed"] = games["completed"].astype(str).str.lower().isin(["true", "1", "yes", "completed"])
+        if games["neutral_site"].dtype != bool:
+            games["neutral_site"] = games["neutral_site"].astype(str).str.lower().isin(["true", "1", "yes"])
+        now = pd.Timestamp.now(tz="UTC")
+        future = games[
+            (games.season == year)
+            & games.season_type.eq("regular")
+            & ~games.completed
+            & games.kickoff.notna()
+            & (games.kickoff >= now)
+            & games.home_team.notna()
+            & games.away_team.notna()
+            & games.home_team.ne("")
+            & games.away_team.ne("")
+        ].copy()
+        # CFBD normally includes classifications on schedule rows; use the FBS roster
+        # as a fallback when those fields are blank so FCS opponents never enter here.
+        has_classifications = games.home_classification.eq("fbs").any() and games.away_classification.eq("fbs").any()
+        if has_classifications:
+            future = future[
+                future.home_classification.eq("fbs") & future.away_classification.eq("fbs")
+            ]
+        else:
+            fbs_teams = fetch_fbs_teams(year)
+            if fbs_teams is None:
+                return None, "Could not verify the FBS team roster for scheduled games."
+            future = future[future.home_team.isin(fbs_teams) & future.away_team.isin(fbs_teams)]
+        future["kickoff_utc"] = future.kickoff.dt.strftime("%b %d, %Y %I:%M %p UTC")
+        return future[["season", "week", "kickoff", "kickoff_utc", "home_team", "away_team", "neutral_site"]].sort_values(
+            ["kickoff", "home_team"]
+        ).reset_index(drop=True), None
+    except Exception as exc:
+        return None, f"Could not fetch upcoming FBS games: {exc}"
+
+
+def project_upcoming_games(upcoming, season_r, recent_r, home_field, form_weight, margin_sd):
+    """Project scheduled matchups using only the currently loaded completed results."""
+    if upcoming is None or upcoming.empty:
+        return pd.DataFrame()
+    rows = []
+    for game in upcoming.itertuples():
+        home = game.home_team
+        away = game.away_team
+        home_rating = (1 - form_weight) * season_r.get(home, 0.0) + form_weight * recent_r.get(home, 0.0)
+        away_rating = (1 - form_weight) * season_r.get(away, 0.0) + form_weight * recent_r.get(away, 0.0)
+        home_margin = home_rating - away_rating + (0.0 if game.neutral_site else home_field)
+        home_probability = 1 / (1 + math.exp(-1.702 * home_margin / margin_sd))
+        rows.append({
+            "Week": int(game.week), "Kickoff (UTC)": game.kickoff_utc,
+            "Away team": away, "Home team": home,
+            "Projected spread": f"{home} {-home_margin:+.1f}",
+            "Home win probability": home_probability,
+            "Away win probability": 1 - home_probability,
+        })
+    return pd.DataFrame(rows)
 
 
 def restrict_to_fbs_matchups(games, fbs_teams):
@@ -403,6 +500,12 @@ with st.sidebar:
         if fetched is not None:
             st.session_state.data_loaded_at = datetime.now(timezone.utc)
             st.session_state.data_source = "CollegeFootballData API · FBS-vs-FBS games"
+    if "upcoming_games" not in st.session_state:
+        upcoming, upcoming_error = fetch_upcoming_games()
+        st.session_state.upcoming_games = upcoming if upcoming is not None else pd.DataFrame()
+        st.session_state.upcoming_error = upcoming_error
+        if upcoming is not None:
+            st.session_state.upcoming_loaded_at = datetime.now(timezone.utc)
     if st.button("Refresh 2026 results"):
         fetched, fetch_error = fetch_games()
         if fetched is not None:
@@ -411,6 +514,14 @@ with st.sidebar:
             st.session_state.data_loaded_at = datetime.now(timezone.utc)
             st.session_state.data_source = "CollegeFootballData API · FBS-vs-FBS games"
             st.success(f"Loaded {len(fetched)} completed games.")
+            upcoming, upcoming_error = fetch_upcoming_games()
+            st.session_state.upcoming_games = upcoming if upcoming is not None else pd.DataFrame()
+            st.session_state.upcoming_error = upcoming_error
+            if upcoming is not None:
+                st.session_state.upcoming_loaded_at = datetime.now(timezone.utc)
+                st.info(f"Found {len(upcoming)} upcoming FBS games.")
+            else:
+                st.warning(upcoming_error)
         else:
             st.session_state.data_note = fetch_error
             st.error(fetch_error)
@@ -494,6 +605,31 @@ st.caption("Ratings are points above/below the field on a neutral site. Spread i
 
 with st.expander("Loaded season results"):
     st.dataframe(games[["week", "away_team", "away_points", "home_team", "home_points"]].sort_values(["week", "home_team"], ascending=[False, True]), hide_index=True, use_container_width=True)
+
+st.markdown("---")
+st.subheader("Upcoming FBS game predictions")
+upcoming = st.session_state.get("upcoming_games", pd.DataFrame())
+if st.session_state.get("upcoming_error"):
+    st.warning(f"Upcoming schedule unavailable: {st.session_state.upcoming_error}")
+elif upcoming.empty:
+    st.info("CollegeFootballData did not return any future regular-season FBS-vs-FBS games. Use **Refresh 2026 results** in the sidebar to check again.")
+else:
+    upcoming_predictions = project_upcoming_games(
+        upcoming, season_r, recent_r, home_field, form_weight, margin_sd
+    )
+    as_of = datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p UTC")
+    st.caption(f"{len(upcoming_predictions)} scheduled matchups · projections generated {as_of}. Ratings use the {len(games)} completed games currently loaded above. Kickoff times are UTC. Download a dated CSV to preserve this snapshot before results change.")
+    st.dataframe(upcoming_predictions.style.format({
+        "Home win probability": "{:.1%}", "Away win probability": "{:.1%}"
+    }), hide_index=True, use_container_width=True)
+    snapshot = upcoming_predictions.copy()
+    snapshot.insert(0, "forecast_generated_utc", datetime.now(timezone.utc).isoformat())
+    st.download_button(
+        "Download upcoming predictions CSV",
+        data=snapshot.to_csv(index=False).encode("utf-8"),
+        file_name=f"cover0_upcoming_predictions_{SEASON}.csv",
+        mime="text/csv",
+    )
 
 st.markdown("---")
 st.subheader("Historical walk-forward backtest")
