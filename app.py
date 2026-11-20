@@ -361,7 +361,8 @@ def fetch_historical_advanced_games(start_year, end_year, historical_games):
             return None, "CollegeFootballData returned no usable advanced FBS game stats for those seasons."
         return advanced, None
     except Exception as exc:
-        return None, f"Could not load advanced game stats: {exc}"@st.cache_data(ttl=86400, show_spinner=False)
+        return None, f"Could not load advanced game stats: {exc}"
+        @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_team_box_scores(year, week):
     """Fetch weekly FBS team box scores from CollegeFootballData."""
     key = os.getenv("CFBD_API_KEY", "").strip()
