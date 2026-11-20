@@ -309,6 +309,62 @@ def fetch_historical_games(start_year, end_year):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def fetch_advanced_game_stats(year):
+    """Fetch per-game PPA, success-rate, and explosiveness inputs for one season."""
+    key = os.getenv("CFBD_API_KEY", "").strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("CFBD_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+    if not key:
+        raise RuntimeError("CFBD_API_KEY is not set in this app's Secrets.")
+    response = requests.get(
+        f"{BASE_URL}/stats/game/advanced",
+        params={"year": year, "seasonType": "regular", "excludeGarbageTime": True},
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=40,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_historical_advanced_games(start_year, end_year, historical_games):
+    """Load advanced game stats, restricted to the FBS-vs-FBS games in the backtest."""
+    records = []
+    teams_by_year = {}
+    for year, games_for_year in historical_games.groupby("season"):
+        teams_by_year[int(year)] = set(games_for_year.home_team) | set(games_for_year.away_team)
+    try:
+        for year in range(start_year, end_year + 1):
+            for game in fetch_advanced_game_stats(year):
+                if str(game.get("seasonType", "regular")).lower() != "regular":
+                    continue
+                team = str(game.get("team") or "").strip()
+                opponent = str(game.get("opponent") or "").strip()
+                if team not in teams_by_year.get(year, set()) or opponent not in teams_by_year.get(year, set()):
+                    continue
+                offense = game.get("offense") or {}
+                defense = game.get("defense") or {}
+                row = {
+                    "season": int(game.get("season", year)),
+                    "week": int(game.get("week", 0) or 0),
+                    "team": team,
+                    "opponent": opponent,
+                }
+                for side, stats in (("off", offense), ("def", defense)):
+                    for api_name, col in (("ppa", "ppa"), ("successRate", "success_rate"), ("explosiveness", "explosiveness")):
+                        row[f"{side}_{col}"] = pd.to_numeric(stats.get(api_name), errors="coerce")
+                records.append(row)
+        advanced = pd.DataFrame(records)
+        if advanced.empty:
+            return None, "CollegeFootballData returned no usable advanced FBS game stats for those seasons."
+        return advanced, None
+    except Exception as exc:
+        return None, f"Could not load advanced game stats: {exc}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_historical_closing_lines(start_year, end_year):
     """Fetch CFBD closing spreads and convert each to an implied home margin."""
     key = os.getenv("CFBD_API_KEY", "").strip()
@@ -542,6 +598,66 @@ def run_holdout_tuning(grid_forecasts, tuning_seasons, holdout_seasons):
     return candidates, best, baseline, tuned
 
 
+def attach_efficiency_signal(forecasts, advanced_games):
+    """Attach a pregame efficiency differential using only earlier weeks."""
+    metric_cols = ["off_ppa", "def_ppa", "off_success_rate", "def_success_rate", "off_explosiveness", "def_explosiveness"]
+    result = forecasts.copy()
+    result["efficiency_signal"] = 0.0
+    for year in sorted(result.season.unique()):
+        year_advanced = advanced_games[advanced_games.season == year]
+        year_rows = result[result.season == year]
+        for week in sorted(year_rows.week.unique()):
+            prior = year_advanced[year_advanced.week < week]
+            if prior.empty:
+                continue
+            team_stats = prior.groupby("team")[metric_cols].mean()
+            z = pd.DataFrame(index=team_stats.index)
+            for col in metric_cols:
+                spread = team_stats[col].std(ddof=0)
+                if pd.isna(spread) or spread <= 1e-9:
+                    z[col] = 0.0
+                else:
+                    z[col] = (team_stats[col] - team_stats[col].mean()) / spread
+            # Higher offensive efficiency and lower efficiency allowed are favorable.
+            team_stats["efficiency_strength"] = (
+                z.off_ppa - z.def_ppa
+                + z.off_success_rate - z.def_success_rate
+                + z.off_explosiveness - z.def_explosiveness
+            ) / 3.0
+            team_strength = team_stats.efficiency_strength.to_dict()
+            target_idx = year_rows.index[year_rows.week == week]
+            result.loc[target_idx, "efficiency_signal"] = [
+                team_strength.get(home, 0.0) - team_strength.get(away, 0.0)
+                for home, away in zip(result.loc[target_idx, "home_team"], result.loc[target_idx, "away_team"])
+            ]
+    return result
+
+
+def tune_efficiency_overlay(forecasts, tuning_seasons, holdout_seasons, margin_sd=14.0):
+    """Tune one efficiency-overlay weight on earlier seasons and report later holdout."""
+    choices = np.arange(0.0, 8.01, 0.25)
+    tuning_rows = forecasts[forecasts.season.isin(tuning_seasons)]
+    scored_tuning = []
+    for weight in choices:
+        predicted = tuning_rows.predicted_home_margin + weight * tuning_rows.efficiency_signal
+        scored_tuning.append({"weight": weight, "mae": float((predicted - tuning_rows.actual_home_margin).abs().mean())})
+    best = min(scored_tuning, key=lambda row: row["mae"])
+
+    def score(seasons, weight):
+        scored = forecasts[forecasts.season.isin(seasons)].copy()
+        scored["predicted_home_margin"] = scored.predicted_home_margin + weight * scored.efficiency_signal
+        scored["absolute_margin_error"] = (scored.predicted_home_margin - scored.actual_home_margin).abs()
+        scored["squared_margin_error"] = (scored.predicted_home_margin - scored.actual_home_margin) ** 2
+        scored["home_win_probability"] = 1 / (1 + np.exp(-1.702 * scored.predicted_home_margin / margin_sd))
+        scored["brier_component"] = (scored.home_win_probability - scored.actual_home_win) ** 2
+        scored["correct_winner"] = ((scored.home_win_probability >= 0.5) == (scored.actual_home_win == 1)).astype(int)
+        return summarize_forecasts(scored).iloc[0]
+
+    baseline = score(holdout_seasons, 0.0)
+    efficiency = score(holdout_seasons, best["weight"])
+    return best, baseline, efficiency
+
+
 def summarize_forecasts(forecasts: pd.DataFrame, group=None):
     by = group or []
     if by:
@@ -769,6 +885,7 @@ if forecast_files:
 st.markdown("---")
 st.subheader("Historical walk-forward backtest")
 st.caption("For each week, the model uses only results from earlier weeks in that season. Historical seasons are fetched from CollegeFootballData.")
+st.caption("The full 2018–2025 run also compares a small PPA, success-rate, and explosiveness overlay. Each forecast uses only advanced stats from earlier weeks; the overlay weight is selected on 2018–2022 and evaluated on 2023–2025.")
 start_year, end_year = st.select_slider(
     "Seasons to evaluate",
     options=list(range(2016, 2026)),
@@ -796,6 +913,29 @@ if st.button("Run historical backtest"):
             else:
                 grid_forecasts = None
                 st.session_state.backtest_forecasts = run_walk_forward_backtest(historical, range(start_year, end_year + 1))
+            if start_year <= 2018 and end_year >= 2025:
+                advanced_games, advanced_error = fetch_historical_advanced_games(start_year, end_year, historical)
+                st.session_state.efficiency_error = advanced_error
+                if advanced_games is not None:
+                    efficiency_forecasts = attach_efficiency_signal(
+                        grid_forecasts[(2.0, 0.25)], advanced_games
+                    )
+                    best_efficiency, baseline_efficiency, enhanced_efficiency = tune_efficiency_overlay(
+                        efficiency_forecasts,
+                        tuning_seasons=range(2018, 2023),
+                        holdout_seasons=range(2023, 2026),
+                    )
+                    st.session_state.efficiency_experiment = {
+                        "weight": best_efficiency["weight"],
+                        "training_mae": best_efficiency["mae"],
+                        "baseline": baseline_efficiency.to_dict(),
+                        "enhanced": enhanced_efficiency.to_dict(),
+                    }
+                else:
+                    st.session_state.efficiency_experiment = None
+            else:
+                st.session_state.efficiency_error = None
+                st.session_state.efficiency_experiment = None
             closing_lines, lines_error = fetch_historical_closing_lines(start_year, end_year)
             st.session_state.backtest_lines_error = lines_error
             st.session_state.holdout_lines = closing_lines
@@ -873,6 +1013,26 @@ if forecasts is not None and not forecasts.empty:
         st.dataframe(holdout_comparison.style.format({
             "Spread_MAE": "{:.2f}", "Winner_Accuracy": "{:.1%}", "Brier_Score": "{:.3f}", "ATS_Win_Rate": "{:.1%}"
         }), hide_index=True, use_container_width=True)
+        efficiency_result = st.session_state.get("efficiency_experiment")
+        if st.session_state.get("efficiency_error"):
+            st.warning(f"The base backtest ran, but the efficiency-input comparison was unavailable: {st.session_state.efficiency_error}")
+        elif efficiency_result:
+            st.markdown("#### Efficiency-input experiment (holdout: 2023–2025)")
+            st.caption("The feature is the difference in teams’ pregame PPA, success-rate, and explosiveness profile, based only on earlier weeks. A weight of zero is the current-score model; the selected weight was tuned on 2018–2022.")
+            efficiency_comparison = pd.DataFrame([
+                {"Model": "Current score-based model", "Weight (points per efficiency unit)": 0.0, **efficiency_result["baseline"]},
+                {"Model": "With efficiency overlay", "Weight (points per efficiency unit)": efficiency_result["weight"], **efficiency_result["enhanced"]},
+            ])
+            st.write(f"Selected overlay weight: **{efficiency_result['weight']:.2f} points per efficiency unit** (2018–2022 training MAE: **{efficiency_result['training_mae']:.2f} points**).")
+            st.dataframe(efficiency_comparison.style.format({
+                "Weight (points per efficiency unit)": "{:.2f}", "Spread_MAE": "{:.2f}",
+                "Margin_RMSE": "{:.2f}", "Winner_Accuracy": "{:.1%}", "Brier_Score": "{:.3f}",
+                "Avg_Home_Win_Prob": "{:.1%}", "Actual_Home_Win_Rate": "{:.1%}",
+            }), hide_index=True, use_container_width=True)
+            if efficiency_result["enhanced"]["Spread_MAE"] < efficiency_result["baseline"]["Spread_MAE"]:
+                st.success("The efficiency overlay improved holdout spread error in this historical comparison. Keep it experimental until it also holds up on future saved forecasts.")
+            else:
+                st.info("The efficiency overlay did not improve holdout spread error, so this comparison does not support adding it to live predictions.")
         if holdout_lines is None or holdout_lines.empty:
             st.caption("ATS results are unavailable because no matching historical closing lines were loaded.")
         st.caption("This is a historical model comparison, not a guarantee of future performance or betting profit.")
