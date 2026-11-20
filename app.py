@@ -361,7 +361,63 @@ def fetch_historical_advanced_games(start_year, end_year, historical_games):
             return None, "CollegeFootballData returned no usable advanced FBS game stats for those seasons."
         return advanced, None
     except Exception as exc:
-        return None, f"Could not load advanced game stats: {exc}"
+        return None, f"Could not load advanced game stats: {exc}"@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_team_box_scores(year, week):
+    """Fetch weekly FBS team box scores from CollegeFootballData."""
+    key = os.getenv("CFBD_API_KEY", "").strip()
+    if not key:
+        try:
+            key = str(st.secrets.get("CFBD_API_KEY", "")).strip()
+        except Exception:
+            key = ""
+    if not key:
+        raise RuntimeError("CFBD_API_KEY is not set in this app's Secrets.")
+    response = requests.get(
+        f"{BASE_URL}/games/teams",
+        params={"year": year, "week": week, "seasonType": "regular", "classification": "fbs"},
+        headers={"Authorization": f"Bearer {key}"}, timeout=40,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_historical_turnovers(start_year, end_year, historical_games):
+    """Load turnovers for historical FBS games in the selected seasons."""
+    rows = []
+    allowed = {(int(g.season), int(g.week), str(g.home_team), str(g.away_team)) for g in historical_games.itertuples()}
+    try:
+        for year, season_games in historical_games.groupby("season"):
+            for week in sorted(season_games.week.unique()):
+                for game in fetch_team_box_scores(int(year), int(week)):
+                    sides = {}
+                    for team in game.get("teams") or []:
+                        side = str(team.get("homeAway") or "").lower()
+                        name = str(team.get("team") or "").strip()
+                        if side not in {"home", "away"} or not name:
+                            continue
+                        turnovers = np.nan
+                        for stat in team.get("stats") or []:
+                            category = re.sub(r"[^a-z]", "", str(stat.get("category", "")).lower())
+                            if category in {"turnover", "turnovers", "turnoverslost"}:
+                                turnovers = pd.to_numeric(stat.get("stat"), errors="coerce")
+                                break
+                        sides[side] = (name, turnovers)
+                    if "home" not in sides or "away" not in sides:
+                        continue
+                    home, home_to = sides["home"]
+                    away, away_to = sides["away"]
+                    if (int(year), int(week), home, away) not in allowed or pd.isna(home_to) or pd.isna(away_to):
+                        continue
+                    rows.append({"season": int(year), "week": int(week), "home_team": home, "away_team": away, "home_turnover_margin": float(away_to - home_to)})
+        data = pd.DataFrame(rows)
+        if data.empty:
+            return None, "CFBD returned no usable turnover box scores for these seasons."
+        return data, None
+    except Exception as exc:
+        return None, f"Could not load historical turnovers: {exc}"
+
+
+
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -658,6 +714,51 @@ def tune_efficiency_overlay(forecasts, tuning_seasons, holdout_seasons, margin_s
     return best, baseline, efficiency
 
 
+def attach_turnover_signal(forecasts, turnover_games):
+    """Use only turnover results from weeks before each forecast."""
+    result = forecasts.copy()
+    result["turnover_signal"] = 0.0
+    for year in sorted(result.season.unique()):
+        year_turnovers = turnover_games[turnover_games.season == year]
+        year_rows = result[result.season == year]
+        for week in sorted(year_rows.week.unique()):
+            prior = year_turnovers[year_turnovers.week < week]
+            if prior.empty:
+                continue
+            team_rows = pd.concat([
+                prior[["home_team", "home_turnover_margin"]].rename(columns={"home_team": "team", "home_turnover_margin": "edge"}),
+                prior[["away_team", "home_turnover_margin"]].assign(edge=lambda d: -d.home_turnover_margin).rename(columns={"away_team": "team"})[["team", "edge"]],
+            ], ignore_index=True)
+            strengths = team_rows.groupby("team").edge.mean()
+            scale = strengths.std(ddof=0)
+            if pd.isna(scale) or scale <= 1e-9:
+                strengths = strengths * 0.0
+            else:
+                strengths = (strengths - strengths.mean()) / scale
+            idx = year_rows.index[year_rows.week == week]
+            result.loc[idx, "turnover_signal"] = [strengths.get(home, 0.0) - strengths.get(away, 0.0) for home, away in zip(result.loc[idx, "home_team"], result.loc[idx, "away_team"])]
+    return result
+
+
+def tune_turnover_overlay(forecasts, tuning_seasons, holdout_seasons, margin_sd=14.0):
+    """Tune on 2018–2022 and evaluate once on later seasons."""
+    training = forecasts[forecasts.season.isin(tuning_seasons)]
+    best = min(({"weight": float(w), "mae": float((training.predicted_home_margin + w * training.turnover_signal - training.actual_home_margin).abs().mean())} for w in np.arange(0.0, 2.01, 0.05)), key=lambda row: row["mae"])
+    def score(seasons, weight):
+        data = forecasts[forecasts.season.isin(seasons)].copy()
+        data["predicted_home_margin"] += weight * data.turnover_signal
+        data["absolute_margin_error"] = (data.predicted_home_margin - data.actual_home_margin).abs()
+        data["squared_margin_error"] = (data.predicted_home_margin - data.actual_home_margin) ** 2
+        data["home_win_probability"] = 1 / (1 + np.exp(-1.702 * data.predicted_home_margin / margin_sd))
+        data["brier_component"] = (data.home_win_probability - data.actual_home_win) ** 2
+        data["correct_winner"] = ((data.home_win_probability >= 0.5) == (data.actual_home_win == 1)).astype(int)
+        return summarize_forecasts(data).iloc[0]
+    return best, score(holdout_seasons, 0.0), score(holdout_seasons, best["weight"])
+
+
+
+
+
 def summarize_forecasts(forecasts: pd.DataFrame, group=None):
     by = group or []
     if by:
@@ -936,6 +1037,19 @@ if st.button("Run historical backtest"):
             else:
                 st.session_state.efficiency_error = None
                 st.session_state.efficiency_experiment = None
+            if start_year <= 2018 and end_year >= 2025:
+                turnover_games, turnover_error = fetch_historical_turnovers(start_year, end_year, historical)
+                st.session_state.turnover_error = turnover_error
+                if turnover_games is not None:
+                    turnover_forecasts = attach_turnover_signal(grid_forecasts[(2.0, 0.25)], turnover_games)
+                    best_turnover, baseline_turnover, enhanced_turnover = tune_turnover_overlay(turnover_forecasts, range(2018, 2023), range(2023, 2026))
+                    st.session_state.turnover_experiment = {"weight": best_turnover["weight"], "training_mae": best_turnover["mae"], "baseline": baseline_turnover.to_dict(), "enhanced": enhanced_turnover.to_dict()}
+                else:
+                    st.session_state.turnover_experiment = None
+            else:
+                st.session_state.turnover_error = None
+                st.session_state.turnover_experiment = None
+
             closing_lines, lines_error = fetch_historical_closing_lines(start_year, end_year)
             st.session_state.backtest_lines_error = lines_error
             st.session_state.holdout_lines = closing_lines
@@ -1033,6 +1147,23 @@ if forecasts is not None and not forecasts.empty:
                 st.success("The efficiency overlay improved holdout spread error in this historical comparison. Keep it experimental until it also holds up on future saved forecasts.")
             else:
                 st.info("The efficiency overlay did not improve holdout spread error, so this comparison does not support adding it to live predictions.")
+        turnover_result = st.session_state.get("turnover_experiment")
+        if st.session_state.get("turnover_error"):
+            st.warning(f"Turnover comparison unavailable: {st.session_state.turnover_error}")
+        elif turnover_result:
+            st.markdown("#### Turnover experiment (holdout: 2023–2025)")
+            st.caption("Each forecast uses turnovers from earlier weeks only. The input is tuned on 2018–2022; live predictions remain unchanged.")
+            turnover_table = pd.DataFrame([
+                {"Model": "Current score-based model", "Weight": 0.0, **turnover_result["baseline"]},
+                {"Model": "With turnover input", "Weight": turnover_result["weight"], **turnover_result["enhanced"]},
+            ])
+            st.write(f"Selected weight: **{turnover_result['weight']:.2f}** (training spread MAE: **{turnover_result['training_mae']:.2f}** points).")
+            st.dataframe(turnover_table.style.format({"Weight": "{:.2f}", "Spread_MAE": "{:.2f}", "Winner_Accuracy": "{:.1%}", "Brier_Score": "{:.3f}"}), hide_index=True, use_container_width=True)
+            if turnover_result["enhanced"]["Spread_MAE"] < turnover_result["baseline"]["Spread_MAE"]:
+                st.success("Turnover improved holdout spread error in this historical test; keep it experimental pending future forecasts.")
+            else:
+                st.info("Turnover did not improve holdout spread error in this test, so it is not added to live predictions.")
+
         if holdout_lines is None or holdout_lines.empty:
             st.caption("ATS results are unavailable because no matching historical closing lines were loaded.")
         st.caption("This is a historical model comparison, not a guarantee of future performance or betting profit.")
