@@ -351,8 +351,7 @@ def fetch_historical_advanced_games(start_year, end_year, historical_games):
                     "week": int(game.get("week", 0) or 0),
                     "team": team,
                     "opponent": opponent,
-                }
-                for side, stats in (("off", offense), ("def", defense)):
+                    for side, stats in (("off", offense), ("def", defense)):
                     for api_name, col in (("ppa", "ppa"), ("successRate", "success_rate"), ("explosiveness", "explosiveness")):
                         row[f"{side}_{col}"] = pd.to_numeric(stats.get(api_name), errors="coerce")
                 records.append(row)
@@ -362,7 +361,7 @@ def fetch_historical_advanced_games(start_year, end_year, historical_games):
         return advanced, None
     except Exception as exc:
         return None, f"Could not load advanced game stats: {exc}"
-        @st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_team_box_scores(year, week):
     """Fetch weekly FBS team box scores from CollegeFootballData."""
     key = os.getenv("CFBD_API_KEY", "").strip()
