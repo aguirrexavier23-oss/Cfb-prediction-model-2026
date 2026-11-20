@@ -351,7 +351,8 @@ def fetch_historical_advanced_games(start_year, end_year, historical_games):
                     "week": int(game.get("week", 0) or 0),
                     "team": team,
                     "opponent": opponent,
-                    for side, stats in (("off", offense), ("def", defense)):
+                }
+                for side, stats in (("off", offense), ("def", defense)):
                     for api_name, col in (("ppa", "ppa"), ("successRate", "success_rate"), ("explosiveness", "explosiveness")):
                         row[f"{side}_{col}"] = pd.to_numeric(stats.get(api_name), errors="coerce")
                 records.append(row)
